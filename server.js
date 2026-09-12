@@ -1,112 +1,221 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const sqlite3 = require('better-sqlite3');
 const crypto = require('crypto');
 const cors = require('cors');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
-const db = new sqlite3.Database('license.db');
+// ─── DATABASE SETUP ───────────────────────────────────────────────────────────
+const db = new sqlite3('license.db');
 
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS keys (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    key_value TEXT UNIQUE NOT NULL,
+db.exec(`
+  CREATE TABLE IF NOT EXISTS keys (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_value   TEXT UNIQUE NOT NULL,
     max_devices INTEGER NOT NULL DEFAULT 1,
-    duration_h INTEGER NOT NULL DEFAULT 24,
-    note TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    is_active INTEGER DEFAULT 1
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS activations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    key_value TEXT NOT NULL,
-    device_id TEXT NOT NULL,
-    device_name TEXT,
-    activated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(key_value, device_id)
-  )`);
-});
+    duration_h  INTEGER NOT NULL DEFAULT 24,
+    note        TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at  DATETIME,
+    is_active   INTEGER DEFAULT 1
+  );
 
-function generateKey(prefix='GAME'){
-  const p=()=>crypto.randomBytes(3).toString('hex').toUpperCase();
-  return `${prefix}-${p()}-${p()}-${p()}`;
+  CREATE TABLE IF NOT EXISTS activations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_value    TEXT NOT NULL,
+    device_id    TEXT NOT NULL,
+    device_name  TEXT,
+    activated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_seen    DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(key_value, device_id)
+  );
+`);
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+function generateKey(prefix = 'GAME') {
+  const part = () => crypto.randomBytes(3).toString('hex').toUpperCase();
+  return `${prefix}-${part()}-${part()}-${part()}`;
 }
 
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'admin123';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'admin-secret-change-me';
 
-function authAdmin(req,res,next){
-  if(req.headers['x-admin-token']!==ADMIN_TOKEN) return res.status(401).json({error:'Unauthorized'});
+function authAdmin(req, res, next) {
+  const token = req.headers['x-admin-token'];
+  if (token !== ADMIN_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-function dbGet(sql, params=[]){ return new Promise((resolve,reject)=>db.get(sql,params,(e,r)=>e?reject(e):resolve(r))); }
-function dbAll(sql, params=[]){ return new Promise((resolve,reject)=>db.all(sql,params,(e,r)=>e?reject(e):resolve(r))); }
-function dbRun(sql, params=[]){ return new Promise((resolve,reject)=>db.run(sql,params,function(e){e?reject(e):resolve(this)})); }
+// ─── /connect — endpoint cho libkeydockguard.so ───────────────────────────────
+// App gửi POST với params: game=, user_key=, serial=
+// Trả về JSON: { active: true/false, status: "...", facts: "..." }
+app.post('/connect', (req, res) => {
+  const user_key = req.body.user_key || req.query.user_key;
+  const serial   = req.body.serial   || req.query.serial;
+  const game     = req.body.game     || req.query.game;
 
-app.post('/api/activate', async (req,res)=>{
-  const {key,device_id,device_name}=req.body;
-  if(!key||!device_id) return res.status(400).json({error:'Thiếu key hoặc device_id'});
-  const k=await dbGet('SELECT * FROM keys WHERE key_value=?',[key]);
-  if(!k) return res.status(404).json({error:'Key không tồn tại'});
-  if(!k.is_active) return res.status(403).json({error:'Key đã bị vô hiệu hoá'});
-  const ex=await dbGet('SELECT * FROM activations WHERE key_value=? AND device_id=?',[key,device_id]);
-  if(ex){
-    await dbRun('UPDATE activations SET last_seen=CURRENT_TIMESTAMP WHERE id=?',[ex.id]);
-    const exp=new Date(new Date(ex.activated_at).getTime()+k.duration_h*3600000);
-    if(exp<new Date()) return res.status(403).json({error:`Phiên ${k.duration_h}h đã hết`});
-    return res.json({success:true,expires_at:exp.toISOString(),remaining_ms:exp-new Date()});
+  if (!user_key) {
+    return res.json({ active: false, status: 'Login rejected.', facts: '' });
   }
-  const row=await dbGet('SELECT COUNT(*) as c FROM activations WHERE key_value=?',[key]);
-  if(row.c>=k.max_devices) return res.status(403).json({error:`Key chỉ cho ${k.max_devices} thiết bị`});
-  await dbRun('INSERT INTO activations(key_value,device_id,device_name) VALUES(?,?,?)',[key,device_id,device_name||'Unknown']);
-  const exp=new Date(Date.now()+k.duration_h*3600000);
-  res.json({success:true,message:'Kích hoạt thành công!',expires_at:exp.toISOString(),remaining_ms:exp-Date.now()});
-});
 
-app.post('/api/check', async (req,res)=>{
-  const {key,device_id}=req.body;
-  const k=await dbGet('SELECT * FROM keys WHERE key_value=?',[key]);
-  if(!k||!k.is_active) return res.json({valid:false,error:'Key không hợp lệ'});
-  const a=await dbGet('SELECT * FROM activations WHERE key_value=? AND device_id=?',[key,device_id]);
-  if(!a) return res.json({valid:false,error:'Thiết bị chưa kích hoạt'});
-  const exp=new Date(new Date(a.activated_at).getTime()+k.duration_h*3600000);
-  if(exp<new Date()) return res.json({valid:false,error:'Phiên đã hết'});
-  await dbRun('UPDATE activations SET last_seen=CURRENT_TIMESTAMP WHERE id=?',[a.id]);
-  res.json({valid:true,expires_at:exp.toISOString(),remaining_ms:exp-new Date()});
-});
+  const keyRow = db.prepare('SELECT * FROM keys WHERE key_value = ?').get(user_key);
 
-app.post('/admin/keys', authAdmin, async (req,res)=>{
-  const{max_devices=1,duration_h=24,note='',count=1,prefix='GAME'}=req.body;
-  const keys=[];
-  for(let i=0;i<Math.min(count,100);i++){
-    const k=generateKey(prefix);
-    await dbRun('INSERT INTO keys(key_value,max_devices,duration_h,note) VALUES(?,?,?,?)',[k,max_devices,duration_h,note]);
-    keys.push(k);
+  if (!keyRow || !keyRow.is_active) {
+    return res.json({ active: false, status: 'Login rejected.', facts: '' });
   }
-  res.json({success:true,keys});
+
+  if (keyRow.expires_at && new Date(keyRow.expires_at) < new Date()) {
+    return res.json({ active: false, status: 'Login rejected.', facts: '' });
+  }
+
+  // Kiểm tra hoặc thêm device
+  const existing = db.prepare(
+    'SELECT * FROM activations WHERE key_value = ? AND device_id = ?'
+  ).get(user_key, serial || 'unknown');
+
+  if (existing) {
+    const activatedAt = new Date(existing.activated_at);
+    const expireTime  = new Date(activatedAt.getTime() + keyRow.duration_h * 3600 * 1000);
+    if (expireTime < new Date()) {
+      return res.json({ active: false, status: 'Login rejected.', facts: '' });
+    }
+    db.prepare('UPDATE activations SET last_seen = CURRENT_TIMESTAMP WHERE id = ?').run(existing.id);
+    return res.json({ active: true, status: 'authorized', facts: game || '' });
+  }
+
+  // Device mới
+  const deviceCount = db.prepare(
+    'SELECT COUNT(*) as cnt FROM activations WHERE key_value = ?'
+  ).get(user_key).cnt;
+
+  if (deviceCount >= keyRow.max_devices) {
+    return res.json({ active: false, status: 'Login rejected.', facts: '' });
+  }
+
+  db.prepare(
+    'INSERT INTO activations (key_value, device_id, device_name) VALUES (?, ?, ?)'
+  ).run(user_key, serial || 'unknown', 'Android');
+
+  return res.json({ active: true, status: 'authorized', facts: game || '' });
 });
 
-app.get('/admin/keys', authAdmin, async (req,res)=>{
-  const keys=await dbAll('SELECT k.*,(SELECT COUNT(*) FROM activations a WHERE a.key_value=k.key_value) as device_count FROM keys k ORDER BY k.created_at DESC');
+// ─── CLIENT API (game gọi) ────────────────────────────────────────────────────
+
+app.post('/api/activate', (req, res) => {
+  const { key, device_id, device_name } = req.body;
+  if (!key || !device_id) return res.status(400).json({ error: 'Missing key or device_id' });
+
+  const keyRow = db.prepare('SELECT * FROM keys WHERE key_value = ?').get(key);
+  if (!keyRow) return res.status(404).json({ error: 'Key không tồn tại' });
+  if (!keyRow.is_active) return res.status(403).json({ error: 'Key đã bị vô hiệu hoá' });
+
+  if (keyRow.expires_at && new Date(keyRow.expires_at) < new Date()) {
+    return res.status(403).json({ error: 'Key đã hết hạn' });
+  }
+
+  const existing = db.prepare(
+    'SELECT * FROM activations WHERE key_value = ? AND device_id = ?'
+  ).get(key, device_id);
+
+  if (existing) {
+    db.prepare('UPDATE activations SET last_seen = CURRENT_TIMESTAMP WHERE id = ?').run(existing.id);
+    const activatedAt = new Date(existing.activated_at);
+    const expireTime  = new Date(activatedAt.getTime() + keyRow.duration_h * 3600 * 1000);
+    const now = new Date();
+    if (expireTime < now) {
+      return res.status(403).json({ error: `Phiên ${keyRow.duration_h}h của thiết bị này đã hết` });
+    }
+    return res.json({ success: true, message: 'Thiết bị đã được xác thực', expires_at: expireTime.toISOString(), remaining_ms: expireTime - now });
+  }
+
+  const deviceCount = db.prepare(
+    'SELECT COUNT(*) as cnt FROM activations WHERE key_value = ?'
+  ).get(key).cnt;
+
+  if (deviceCount >= keyRow.max_devices) {
+    return res.status(403).json({ error: `Key này chỉ cho phép tối đa ${keyRow.max_devices} thiết bị` });
+  }
+
+  db.prepare(
+    'INSERT INTO activations (key_value, device_id, device_name) VALUES (?, ?, ?)'
+  ).run(key, device_id, device_name || 'Unknown');
+
+  const expireTime = new Date(Date.now() + keyRow.duration_h * 3600 * 1000);
+  return res.json({ success: true, message: 'Kích hoạt thành công!', expires_at: expireTime.toISOString(), remaining_ms: expireTime - Date.now() });
+});
+
+app.post('/api/check', (req, res) => {
+  const { key, device_id } = req.body;
+  if (!key || !device_id) return res.status(400).json({ valid: false, error: 'Missing params' });
+
+  const keyRow = db.prepare('SELECT * FROM keys WHERE key_value = ?').get(key);
+  if (!keyRow || !keyRow.is_active) return res.json({ valid: false, error: 'Key không hợp lệ' });
+
+  if (keyRow.expires_at && new Date(keyRow.expires_at) < new Date()) {
+    return res.json({ valid: false, error: 'Key đã hết hạn' });
+  }
+
+  const activation = db.prepare(
+    'SELECT * FROM activations WHERE key_value = ? AND device_id = ?'
+  ).get(key, device_id);
+
+  if (!activation) return res.json({ valid: false, error: 'Thiết bị chưa được kích hoạt' });
+
+  const activatedAt = new Date(activation.activated_at);
+  const expireTime  = new Date(activatedAt.getTime() + keyRow.duration_h * 3600 * 1000);
+
+  if (expireTime < new Date()) {
+    return res.json({ valid: false, error: `Phiên ${keyRow.duration_h}h đã hết` });
+  }
+
+  db.prepare('UPDATE activations SET last_seen = CURRENT_TIMESTAMP WHERE id = ?').run(activation.id);
+  return res.json({ valid: true, expires_at: expireTime.toISOString(), remaining_ms: expireTime - Date.now() });
+});
+
+// ─── ADMIN API ────────────────────────────────────────────────────────────────
+
+app.post('/admin/keys', authAdmin, (req, res) => {
+  const { max_devices = 1, duration_h = 24, note = '', count = 1, prefix = 'GAME', expires_at } = req.body;
+  const created = [];
+  for (let i = 0; i < Math.min(count, 100); i++) {
+    const key = generateKey(prefix);
+    db.prepare(
+      'INSERT INTO keys (key_value, max_devices, duration_h, note, expires_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(key, max_devices, duration_h, note, expires_at || null);
+    created.push(key);
+  }
+  res.json({ success: true, keys: created });
+});
+
+app.get('/admin/keys', authAdmin, (req, res) => {
+  const keys = db.prepare(`
+    SELECT k.*,
+      (SELECT COUNT(*) FROM activations a WHERE a.key_value = k.key_value) as device_count
+    FROM keys k ORDER BY k.created_at DESC
+  `).all();
   res.json(keys);
 });
 
-app.delete('/admin/keys/:key', authAdmin, async (req,res)=>{
-  await dbRun('UPDATE keys SET is_active=0 WHERE key_value=?',[req.params.key]);
-  res.json({success:true});
+app.delete('/admin/keys/:key', authAdmin, (req, res) => {
+  db.prepare('UPDATE keys SET is_active = 0 WHERE key_value = ?').run(req.params.key);
+  res.json({ success: true });
 });
 
-app.get('/admin/keys/:key/devices', authAdmin, async (req,res)=>{
-  res.json(await dbAll('SELECT * FROM activations WHERE key_value=?',[req.params.key]));
+app.get('/admin/keys/:key/devices', authAdmin, (req, res) => {
+  const devices = db.prepare(
+    'SELECT * FROM activations WHERE key_value = ? ORDER BY activated_at DESC'
+  ).all(req.params.key);
+  res.json(devices);
 });
 
-app.delete('/admin/activations/:key/:did', authAdmin, async (req,res)=>{
-  await dbRun('DELETE FROM activations WHERE key_value=? AND device_id=?',[req.params.key,req.params.did]);
-  res.json({success:true});
+app.delete('/admin/activations/:key/:device_id', authAdmin, (req, res) => {
+  db.prepare('DELETE FROM activations WHERE key_value = ? AND device_id = ?')
+    .run(req.params.key, req.params.device_id);
+  res.json({ success: true });
 });
 
-const PORT=process.env.PORT||3000;
-app.listen(PORT,()=>console.log(`Server running on port ${PORT}`));
+// ─── START ────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ License server running on port ${PORT}`));
